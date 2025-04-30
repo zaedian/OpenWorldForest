@@ -1050,7 +1050,7 @@ class Chunk {
 		this.createTrees();
 		this.createRocks();
 		this.createBushes();
-		this.createTreeLog();
+		//this.createTreeLog();
 	}
 
 	random() {
@@ -1155,7 +1155,7 @@ updateLeavesWind() { // No parameters needed now
         return;
     }
 
-    const windStrength = 0.0005;
+    const windStrength = 0.001;
     // windDirection is not currently used in the sway calculation, but keep if needed later
     // const windDirection = new THREE.Vector3(1, 0, 0);
 
