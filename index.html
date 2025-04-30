@@ -1,0 +1,1470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Third-Person 3D Multiplayer Game Made with Three.js, Node.js, Socket.io, and Express</title>
+    <script src="three.min.js"></script>
+    <script src="GLTFLoader.js"></script>
+    <script src="FBXLoader.js"></script>
+    <script src="fflate.min.js"></script>
+    <script src="socket.io.min.js"></script>
+	<script src="EffectComposer.js"></script>
+	<script src="RenderPass.js"></script>
+	<script src="ShaderPass.js"></script>
+	<script src="BloomPass.js"></script>
+	<script src="CopyShader.js"></script>
+	<script src="ConvolutionShader.js"></script>
+	<script src="LuminosityHighPassShader.js"></script>
+	<script type="module" src="CustomShaderFirstPerson.js"></script>
+	<script type="module" src="CustomShaderThirdPerson.js"></script>
+
+	<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="chat-container">
+    <div id="chat-messages"></div>
+    <input type="text" id="chat-input" placeholder="Type a message">
+</div>
+
+<script type="module">
+
+// Sound
+
+let footstepSound = new Audio('sounds/footstep.ogg'); // Walking sound
+let runningSound = new Audio('sounds/running.ogg');   // Running sound
+let backgroundSound = new Audio('sounds/forest.ogg'); // Background sound
+
+backgroundSound.loop = true;
+backgroundSound.volume = 0.2;
+
+let lastFootstepTime = 0; // Prevent multiple footstep sounds per frame
+
+// Only play background sound after user interacts with the page
+const initAudio = () => {
+    backgroundSound.play().catch(err => {
+        console.warn('Autoplay failed:', err);
+    });
+
+    // Remove listener after first interaction
+    window.removeEventListener('click', initAudio);
+    window.removeEventListener('keydown', initAudio);
+};
+
+// Set up listener for first interaction
+window.addEventListener('click', initAudio);
+window.addEventListener('keydown', initAudio);
+
+// Sound end
+
+	const socket = io('https://openworldforestserver.onrender.com');
+    //const socket = io('http://localhost:3000');
+	
+    let localPlayerId = null;
+    let clonedPlayers = {};
+    const players = {}; // Store players by their ID
+    const textureLoader = new THREE.TextureLoader();
+    let shakeDuration = 0, shakeIntensity = 0.01;
+    let playerModel, mixer, isPlayerModelLoaded = false;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87CEEB);
+    let viewMode = 'third-person';
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap; // Good balance between soft & performance
+
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+    const composer = new THREE.EffectComposer(renderer);
+    composer.addPass(new THREE.RenderPass(scene, camera));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    import { CustomShaderFirstPerson } from './CustomShaderFirstPerson.js';
+    const customShaderFirstPersonPass = new THREE.ShaderPass(CustomShaderFirstPerson);
+    import { CustomShaderThirdPerson } from './CustomShaderThirdPerson.js';
+    const CustomShaderThirdPersonPass = new THREE.ShaderPass(CustomShaderThirdPerson);
+    composer.addPass(CustomShaderThirdPersonPass);
+    const raycaster = new THREE.Raycaster();
+
+
+
+    const isPointNearRay = (rayOrigin, rayDirection, point, maxDistance) => {
+        const toPoint = new THREE.Vector3().subVectors(point, rayOrigin);
+        const projectionLength = toPoint.dot(rayDirection);
+        const closestPoint = new THREE.Vector3().copy(rayDirection).multiplyScalar(projectionLength).add(rayOrigin);
+        return point.distanceTo(closestPoint) <= maxDistance && projectionLength >= 0 && projectionLength <= 20;
+    };
+
+	
+	
+
+
+    scene.fog = new THREE.FogExp2(0xcccccc, 0.007);
+    const skyboxloader = new THREE.CubeTextureLoader();
+    scene.background = skyboxloader.load([
+        'skybox/clouds1_east_iq8cr6.png', 'skybox/clouds1_west_gwd0gs.png', 'skybox/clouds1_up_tnxqka.png',
+        'skybox/clouds1_down_p10z7n.png', 'skybox/clouds1_north_anykiq.png', 'skybox/clouds1_south_bek22d.png'
+    ]);
+
+
+
+    const ambientLight = new THREE.AmbientLight(0x404040, 2);
+    scene.add(ambientLight);
+
+
+    const loader = new THREE.GLTFLoader();
+    const fbxLoader = new THREE.FBXLoader();
+    let currentAction, walkAction, walkBackAction, runBackAction, walkLeftAction, walkRightAction, runLeftAction, runRightAction, runAction, idleAction, walkRightForwardAction, runRightForwardAction, walkLeftForwardAction, runLeftForwardAction, jumpAction;
+
+    const clock = new THREE.Clock();
+    const animations = {};
+
+
+    // Load player model, set up shadows, scale, position, add to scene, emit loaded, init mixer, load animations.
+    loader.load('models/ThePlayerModel.glb', (gltf) => {
+        playerModel = gltf.scene;
+        isPlayerModelLoaded = true;
+        playerModel.traverse(o => o.isMesh && (o.castShadow = true, o.receiveShadow = true));
+        playerModel.scale.set(1, 1, 1);
+        playerModel.position.set(0, 0, 0);
+        scene.add(playerModel);
+        socket.emit('model-loaded');
+        mixer = new THREE.AnimationMixer(playerModel);
+        loadAnimations(loader, mixer, animations); // Pass the necessary parameters here
+
+        // Add the finished listener ONCE for the local player's mixer
+        mixer.addEventListener('finished', (e) => {
+            if (e.action === jumpAction) {
+                isJumping = false; // Jump animation finished, update state for camera/network
+
+                // Determine next animation based on current movement state
+                const moving = keysPressed['w'] || keysPressed['s'] || keysPressed['a'] || keysPressed['d'];
+                let nextAfterJump = idleAction; // Default to idle
+                if (moving) {
+                     if (keysPressed['w'] && keysPressed['a']) {
+                        nextAfterJump = isRunning ? runLeftForwardAction : walkLeftForwardAction;
+                    } else if (keysPressed['w'] && keysPressed['d']) {
+                        nextAfterJump = isRunning ? runRightForwardAction : walkRightForwardAction;
+                    } else if (keysPressed['w']) {
+                        nextAfterJump = isRunning ? runAction : walkAction;
+                    } else if (keysPressed['s']) {
+                        nextAfterJump = isRunning ? runBackAction : walkBackAction;
+                    } else if (keysPressed['a']) {
+                        nextAfterJump = isRunning ? runLeftAction : walkLeftAction;
+                    } else if (keysPressed['d']) {
+                        nextAfterJump = isRunning ? runRightAction : walkRightAction;
+                    }
+                }
+                 // Transition to the determined animation
+                updateAction(nextAfterJump);
+            }
+        });
+
+    }, undefined, error => console.error('Error loading player model:', error));
+
+
+    function loadAnimations(loader, mixer, animations) {
+        const animPaths = {
+            idle: 'animations/Idle.fbx',
+            walk: 'animations/Walking.fbx',
+            walkBack: 'animations/Walkback.fbx',
+            run: 'animations/Running.fbx',
+            runBack: 'animations/Runningback.fbx',
+            walkLeft: 'animations/Walkleft.fbx',
+            walkRight: 'animations/Walkright.fbx',
+            runLeft: 'animations/Runleft.fbx',
+            runRight: 'animations/Runright.fbx',
+            walkRightForward: 'animations/Walkrightforward.fbx',
+            walkLeftForward: 'animations/Walkleftforward.fbx',
+            runRightForward: 'animations/Runrightforward.fbx',
+            runLeftForward: 'animations/Runleftforward.fbx',
+            jump: 'animations/Jump.fbx',
+        };
+
+        for (const name in animPaths) {
+            fbxLoader.load(animPaths[name], (anim) => {
+                animations[name] = anim.animations[0];
+                const action = mixer.clipAction(animations[name]);
+
+                if (name === 'jump') {
+                    action.loop = THREE.LoopOnce;
+                    action.clampWhenFinished = true; // Stop at the last frame
+                    jumpAction = action; // Assign to the global variable
+                } else {
+                    action.loop = THREE.LoopRepeat;
+                    // Assign other actions here
+                    if (name === 'idle') idleAction = action;
+                    else if (name === 'walk') walkAction = action;
+                    else if (name === 'walkBack') walkBackAction = action;
+                    else if (name === 'run') runAction = action;
+                    else if (name === 'runBack') runBackAction = action;
+                    else if (name === 'walkLeft') walkLeftAction = action;
+                    else if (name === 'walkRight') walkRightAction = action;
+                    else if (name === 'runLeft') runLeftAction = action;
+                    else if (name === 'runRight') runRightAction = action;
+                    else if (name === 'walkRightForward') walkRightForwardAction = action;
+                    else if (name === 'walkLeftForward') walkLeftForwardAction = action;
+                    else if (name === 'runRightForward') runRightForwardAction = action;
+                    else if (name === 'runLeftForward') runLeftForwardAction = action;
+                }
+
+
+                // Initialize current action AFTER all animations are loaded is better,
+                // but for now, set idle if it's the first loaded and currentAction is null.
+                if (name === 'idle' && !currentAction) {
+                    idleAction = action; // Ensure idleAction is assigned
+                    currentAction = idleAction;
+                    currentAction.play();
+                }
+
+            }, undefined, error => console.error('Error loading animation:', error));
+        }
+    }
+
+
+
+
+    let bobbingTime = 0, bobbingIntensityWalking = 0.1, bobbingIntensityRunning = 0.15;
+    let bobbingSpeedWalking = 0.055, bobbingSpeedRunning = 0.1;
+
+
+    //jump
+    let jumpBumpOffset = 0; // Vertical offset for jump effect
+    let jumpBumpVelocity = 0; // How fast the camera moves during jump
+    const jumpBumpStrength = 0.08; // Initial "kick" when jumping
+    const jumpGravity = 0.25; // How fast it falls back
+    let isJumping = false; // Track if in jump state (for camera/network)
+
+    function updateCamera(delta) {
+    if (!playerModel) return;
+
+    // Shake effect
+    let shakeOffset = new THREE.Vector3(0, 0, 0);
+    if (shakeDuration > 0) {
+        shakeOffset.set(
+            (Math.random() - 0.5) * shakeIntensity,
+            (Math.random() - 0.5) * shakeIntensity,
+            (Math.random() - 0.5) * shakeIntensity
+        );
+        shakeDuration -= delta;
+    }
+
+    // Third-person view
+    if (viewMode === 'third-person') {
+        const distance = 5, height = 3;
+        const offset = new THREE.Vector3(
+            Math.sin(yaw) * distance,
+            Math.cos(yaw) * distance,
+            playerModel.position.y + height - Math.sin(pitch) * distance
+        );
+        camera.position.set(
+            playerModel.position.x - offset.x,
+            offset.z,
+            playerModel.position.z - offset.y
+        ).add(shakeOffset);
+        camera.lookAt(playerModel.position);
+        playerModel.rotation.y = yaw;
+
+        // Show the player model in third-person view
+        playerModel.traverse((object) => {
+            if (object.isMesh) {
+                // Make sure it's visible and casts shadows
+                object.visible = true;
+                object.material.transparent = false;  // Ensure it's fully opaque
+                object.material.opacity = 1;         // Fully opaque
+                object.material.alphaTest = 0;      // Reset alphaTest (not needed for full opacity)
+                object.castShadow = true;
+            }
+        });
+    }
+
+    // First-person view
+    else if (viewMode === 'first-person') {
+        const headHeight = 1.5;
+
+        // Apply jump bump physics
+        if (isJumping) {
+            jumpBumpOffset += jumpBumpVelocity;
+            jumpBumpVelocity -= jumpGravity * delta;
+
+            if (jumpBumpOffset <= 0) {
+                jumpBumpOffset = 0;
+                jumpBumpVelocity = 0;
+            }
+        } else {
+            if (jumpBumpOffset !== 0) jumpBumpOffset = 0;
+        }
+
+        camera.position.set(
+            playerModel.position.x,
+            playerModel.position.y + headHeight + jumpBumpOffset,
+            playerModel.position.z
+        ).add(shakeOffset);
+
+        // Apply head bobbing only when walking or running and not jumping
+        if ((isWalking || isRunning) && !isJumping) {
+            bobbingTime += isRunning ? bobbingSpeedRunning : bobbingSpeedWalking;
+            camera.position.y += Math.sin(bobbingTime) * (isRunning ? bobbingIntensityRunning : bobbingIntensityWalking);
+        }
+
+        // Pitch clamp
+        pitch = Math.max(Math.min(pitch, Math.PI / 2), -Math.PI / 2);
+        playerModel.rotation.y = yaw;
+
+        const quaternion = new THREE.Quaternion();
+        quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw - Math.PI)
+            .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), pitch));
+        camera.quaternion.copy(quaternion);
+
+        // Hide the player model in first-person view but keep shadows
+        playerModel.traverse((object) => {
+            if (object.isMesh) {
+                // Set object to be fully transparent but still cast shadows
+                object.material.transparent = true;
+                object.material.opacity = 0;  // Full transparency
+                object.material.alphaTest = 0.01;  // Ensures it's not rendered but still there for shadows
+                object.castShadow = true;
+                object.visible = true; // Keep visible for shadow casting but invisible to the camera
+            }
+        });
+    }
+}
+
+
+
+
+    const keysPressed = {};
+    let isRunning = false, isWalking = false, isShiftPressed = false;
+    let jumpTriggered = false; // Flag to signal a jump intention
+
+    window.addEventListener('keydown', (event) => {
+        const key = event.key.toLowerCase();
+
+        if (['w', 'a', 's', 'd'].includes(key)) {
+            keysPressed[key] = true;
+            // isWalking and isRunning are now determined in updateAnimationState
+        }
+
+        if (event.key === 'Shift') {
+            isShiftPressed = true;
+            // isRunning is now determined in updateAnimationState
+        }
+
+        // Spacebar pressed to trigger jump
+        // Only trigger jump if not already in the jump animation
+        if (key === ' ' && currentAction !== jumpAction) {
+            jumpTriggered = true; // Mark that jump has been triggered
+            // isJumping state for camera/network is set when the animation actually starts
+            if (viewMode === 'first-person') {
+                jumpBumpVelocity = jumpBumpStrength; // This camera effect can still be triggered here
+            }
+        }
+
+        // Toggle camera view with 'P'
+        if (event.key.toLowerCase() === 'p') {
+            viewMode = viewMode === 'third-person' ? 'first-person' : 'third-person';
+            const passIndex = composer.passes.indexOf(customShaderFirstPersonPass);
+            if (viewMode === 'first-person' && passIndex === -1) {
+                composer.addPass(customShaderFirstPersonPass);
+            } else if (viewMode === 'third-person' && passIndex !== -1) {
+                composer.passes.splice(passIndex, 1);
+            }
+        }
+    });
+
+    window.addEventListener('keyup', (event) => {
+        const key = event.key.toLowerCase();
+
+        if (['w', 'a', 's', 'd'].includes(key)) {
+            keysPressed[key] = false;
+            // isWalking and isRunning are now determined in updateAnimationState
+        }
+
+        if (event.key === 'Shift') {
+            isShiftPressed = false;
+            // isRunning is now determined in updateAnimationState
+        }
+    });
+
+
+
+
+
+
+
+    // Direction constants for 8 possible orientations
+    const DIRECTIONS = {
+        'N': Math.PI, 'NE': 3 * Math.PI / 4, 'E': Math.PI / 2, 'SE': Math.PI / 4,
+        'S': 0, 'SW': -Math.PI / 4, 'W': -Math.PI / 2, 'NW': -3 * Math.PI / 4
+    };
+
+
+
+
+   let moveSpeed = 0.1;
+
+let lastStepPosition = new THREE.Vector3();
+let stepDistanceThreshold = 1.0; // You can tweak this value
+
+function moveCharacter() {
+    if (!playerModel) return;
+
+    let baseSpeed = isRunning ? 0.05 : 0.015;
+	//let baseSpeed = isRunning ? 0.2 : 0.015;
+	//let baseSpeed = isRunning ? 12000 : 0.015;
+
+    if (keysPressed['s'] && !(keysPressed['w'] || keysPressed['a'] || keysPressed['d'])) {
+        baseSpeed *= 0.5;
+    }
+
+    moveSpeed = baseSpeed;
+
+    const rotation = playerModel.rotation.y;
+    const direction = new THREE.Vector3();
+
+    const keyMap = {
+        'w': [Math.sin(rotation), Math.cos(rotation)],
+        's': [-Math.sin(rotation), -Math.cos(rotation)],
+        'a': [-Math.sin(rotation - Math.PI / 2), -Math.cos(rotation - Math.PI / 2)],
+        'd': [-Math.sin(rotation + Math.PI / 2), -Math.cos(rotation + Math.PI / 2)],
+    };
+
+    Object.keys(keyMap).forEach(key => {
+        if (keysPressed[key.toLowerCase()]) {
+            direction.x += keyMap[key][0];
+            direction.z += keyMap[key][1];
+        }
+    });
+
+    if (direction.lengthSq() > 0) {
+        direction.normalize().multiplyScalar(moveSpeed);
+        const proposedPos = playerModel.position.clone().add(direction);
+        const playerRadius = 1.2;
+
+        const colliders = getNearbyCollisionObjects(proposedPos.x, proposedPos.z);
+        let collided = false;
+        let collisionNormal = new THREE.Vector3();
+
+        for (const obj of colliders) {
+            const dist = proposedPos.distanceTo(obj.position);
+            if (dist < obj.radius + playerRadius) {
+                collided = true;
+                const toCollider = proposedPos.clone().sub(obj.position);
+                const distance = toCollider.length();
+                collisionNormal = toCollider.normalize();
+                proposedPos.add(collisionNormal.multiplyScalar(playerRadius + obj.radius - distance));
+                break;
+            }
+        }
+
+        playerModel.position.copy(proposedPos);
+
+        // Match terrain height
+        const terrainY = getHeightAt(playerModel.position.x, playerModel.position.z);
+        playerModel.position.y += (terrainY + 0.03 - playerModel.position.y) * 0.2;
+
+        // 🔊 Footstep sound based on distance moved
+		const distanceMoved = playerModel.position.distanceTo(lastStepPosition);
+		const stepThreshold = isRunning ? 2.7 : 1.6; // tweak these values until it feels natural
+
+		if (distanceMoved > stepThreshold) {
+			//const sound = isRunning ? runningSound : footstepSound;
+
+			//sound.pause();
+			//sound.currentTime = 0;
+			//sound.play();
+
+			//lastStepPosition.copy(playerModel.position);
+		}
+    }
+}
+
+
+function getNearbyCollisionObjects(x, z) {
+    const chunkX = Math.floor(x / 100);
+    const chunkZ = Math.floor(z / 100);
+    const colliders = [];
+
+    for (let dz = -1; dz <= 1; dz++) {
+        for (let dx = -1; dx <= 1; dx++) {
+            const key = `${chunkX + dx},${chunkZ + dz}`;
+            if (loadedChunks[key]) {
+                colliders.push(...loadedChunks[key].collisionObjects);
+            }
+        }
+    }
+    return colliders;
+}
+
+
+
+
+    function updateAnimationState() {
+        // Ensure all necessary actions are loaded
+        if (!idleAction || !walkAction || !runAction || !jumpAction ||
+            !walkBackAction || !runBackAction || !walkLeftAction || !walkRightAction ||
+            !runLeftAction || !runRightAction || !walkRightForwardAction ||
+            !runRightForwardAction || !walkLeftForwardAction || !runLeftForwardAction) {
+             //console.warn("Not all animations loaded yet for local player.");
+             return; // Wait until all animations are loaded
+        }
+
+
+        const moving = keysPressed['w'] || keysPressed['s'] || keysPressed['a'] || keysPressed['d'];
+        isWalking = moving;
+        isRunning = moving && isShiftPressed;
+
+        let nextAction = currentAction; // Assume we stay in the current action unless a condition changes
+
+        // Prioritize jump animation if triggered and not already jumping
+        if (jumpTriggered && currentAction !== jumpAction) {
+            nextAction = jumpAction;
+            isJumping = true; // Set isJumping state for camera/network
+            jumpTriggered = false; // Consume the trigger
+        } else if (currentAction !== jumpAction) { // Only consider movement animations if not jumping
+            if (moving) {
+                // Determine the correct movement animation
+                if (keysPressed['w'] && keysPressed['a']) {
+                    nextAction = isRunning ? runLeftForwardAction : walkLeftForwardAction;
+                } else if (keysPressed['w'] && keysPressed['d']) {
+                    nextAction = isRunning ? runRightForwardAction : walkRightForwardAction;
+                } else if (keysPressed['w']) {
+                    nextAction = isRunning ? runAction : walkAction;
+                } else if (keysPressed['s']) {
+                    nextAction = isRunning ? runBackAction : walkBackAction;
+                } else if (keysPressed['a']) {
+                    nextAction = isRunning ? runLeftAction : walkLeftAction;
+                } else if (keysPressed['d']) {
+                    nextAction = isRunning ? runRightAction : walkRightAction;
+                } else if (keysPressed['a']) { // Redundant check - removed
+                    nextAction = isRunning ? runLeftAction : walkLeftAction; // Redundant - removed
+                } else if (keysPressed['d']) { // Redundant check - removed
+                    nextAction = isRunning ? runRightAction : walkRightAction; // Redundant - removed
+                }
+            } else {
+                // Not moving and not jumping, go to idle
+                nextAction = idleAction;
+            }
+        }
+        // If currently in jump action, stay in it until it finishes (handled by the event listener)
+
+        if (currentAction !== nextAction) {
+            updateAction(nextAction);
+        }
+    }
+
+    // Helper function to switch actions with fading
+    function updateAction(newAction) {
+        if (currentAction === newAction) return; // No change if already on the same action
+
+        // Crossfade to the new action
+        currentAction.fadeOut(0.2);
+        currentAction = newAction;
+        currentAction.reset().fadeIn(0.2).play();
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+    const loadingPlayers = new Set();
+
+// Remove the jumpInProgress flag completely as it's not needed for cloned players
+// let jumpInProgress = false; // REMOVE THIS LINE
+
+// Modify loadAnimationsForClonedPlayer to remove the 'finished' event listener for jump
+function loadAnimationsForClonedPlayer(playerClone) {
+    const animationLoader = new THREE.FBXLoader();
+    const animationPaths = {
+        idle: 'animations/Idle.fbx',
+        walk: 'animations/Walking.fbx',
+        walkBack: 'animations/Walkback.fbx',
+        run: 'animations/Running.fbx',
+        runBack: 'animations/Runningback.fbx',
+        walkLeft: 'animations/Walkleft.fbx',
+        walkRight: 'animations/Walkright.fbx',
+        runLeft: 'animations/Runleft.fbx',
+        runRight: 'animations/Runright.fbx',
+        walkRightForward: 'animations/Walkrightforward.fbx',
+        walkLeftForward: 'animations/Walkleftforward.fbx',
+        runRightForward: 'animations/Runrightforward.fbx',
+        runLeftForward: 'animations/Runleftforward.fbx',
+        jump: 'animations/Jump.fbx'
+    };
+
+    const actions = {};
+    const entries = Object.entries(animationPaths);
+    let loadedCount = 0;
+
+    entries.forEach(([name, path]) => {
+        animationLoader.load(`${path}`, (anim) => {
+            const clip = anim.animations[0];
+            const action = playerClone.mixer.clipAction(clip);
+
+            if (name === 'jump') {
+                action.loop = THREE.LoopOnce;
+                action.clampWhenFinished = true;
+                // REMOVE the event listener for 'finished' on the jump action here for clones
+                // playerClone.mixer.addEventListener('finished', ...); // REMOVE THIS BLOCK
+            } else {
+                action.loop = THREE.LoopRepeat;
+            }
+
+            actions[name + 'Action'] = action; // Store actions with 'Action' suffix
+
+            loadedCount++;
+
+            if (loadedCount === entries.length) {
+                playerClone.animations = actions;
+                // Initialize currentAction AFTER all animations are loaded
+                playerClone.currentAction = actions.idleAction;
+                playerClone.animationsReady = true; // Set flag after animations are ready
+                actions.idleAction.play();
+            }
+        }, undefined, error => console.error(`Error loading animation ${name}:`, error));
+    });
+}
+
+
+// Revised updateAnimationStateForClonedPlayer function
+function updateAnimationStateForClonedPlayer(playerClone, keysPressed = {}, isRunning, isJumping) {
+    if (!playerClone.animationsReady || !playerClone.mixer || !playerClone.animations) return;
+
+    const a = playerClone.animations; // Shorthand for animations object
+    let nextAction = playerClone.currentAction;
+
+    const isMoving = keysPressed['w'] || keysPressed['s'] || keysPressed['a'] || keysPressed['d'];
+
+    // Determine the desired action based on the received state
+    let desiredAction;
+    if (isJumping) {
+        desiredAction = a.jumpAction;
+    } else if (isMoving) {
+        // Determine the correct movement animation based on received state
+        if (keysPressed['w'] && keysPressed['a']) {
+            desiredAction = isRunning ? a.runLeftForwardAction : a.walkLeftForwardAction;
+        } else if (keysPressed['w'] && keysPressed['d']) {
+            desiredAction = isRunning ? a.runRightForwardAction : a.walkRightForwardAction;
+        } else if (keysPressed['w']) {
+            desiredAction = isRunning ? a.runAction : a.walkAction;
+        } else if (keysPressed['s']) {
+            desiredAction = isRunning ? a.runBackAction : a.walkBackAction;
+        } else if (keysPressed['a']) {
+            desiredAction = isRunning ? a.runLeftAction : a.walkLeftAction;
+        } else if (keysPressed['d']) {
+            desiredAction = isRunning ? a.runRightAction : a.walkRightAction;
+        } else {
+             // Fallback to idle if moving but no specific direction detected (shouldn't happen with current keyMap logic)
+             desiredAction = a.idleAction;
+        }
+    } else {
+        desiredAction = a.idleAction;
+    }
+
+    // --- Transition logic ---
+    if (playerClone.currentAction !== desiredAction) {
+        // Handle transitions
+        if (desiredAction === a.jumpAction) {
+             // If transitioning *into* jump, stop the previous animation abruptly
+             // and start the jump animation immediately for responsiveness.
+             if (playerClone.currentAction) {
+                 playerClone.currentAction.stop();
+             }
+             playerClone.currentAction = desiredAction;
+             playerClone.currentAction.reset().play();
+        } else {
+             // For all other transitions, use a smooth fadeOut
+             if (playerClone.currentAction) {
+                 playerClone.currentAction.fadeOut(0.2);
+             }
+             playerClone.currentAction = desiredAction;
+             playerClone.currentAction.reset().fadeIn(0.2).play();
+        }
+    }
+    // If currentAction is already desiredAction, do nothing.
+    // The jump animation's clampWhenFinished will hold it on the last frame
+    // until the server sends isJumping: false, at which point the logic above
+    // will transition to the appropriate movement/idle state.
+}
+
+
+
+    // Helper function for cloned player action updates
+    function updateActionForClonedPlayer(playerClone, newAction) {
+        if (playerClone.currentAction === newAction) return;
+
+        if (playerClone.currentAction) {
+            playerClone.currentAction.fadeOut(0.2);
+        }
+        playerClone.currentAction = newAction;
+        playerClone.currentAction.reset().fadeIn(0.2).play();
+    }
+
+
+    let lastPositionUpdateTime = 0;
+    const positionUpdateInterval = 0; // Update frequency in milliseconds (0 means every frame)
+
+    function animate() {
+        requestAnimationFrame(animate);
+
+		if (!playerModel) return;
+
+        const delta = clock.getDelta();
+
+
+
+// Sun north-west and above the player
+Sun.position.x = playerModel.position.x - 15;   // West offset (negative X)
+Sun.position.y = playerModel.position.y + 30;   // Height
+Sun.position.z = playerModel.position.z + 35;   // North offset (positive Z)
+
+// Aim at the player so light shines from NW → SW
+Sun.target.position.set(
+    playerModel.position.x,
+    playerModel.position.y,
+    playerModel.position.z
+);
+Sun.target.updateMatrixWorld();
+
+
+    //Wind
+    // Update wind particles each frame
+    if (material) {
+        updateWindParticles();
+    }
+    // Tree leaves sway in the wind
+    for (const key in loadedChunks) {
+        if (loadedChunks[key] && typeof loadedChunks[key].updateLeavesWind === 'function') {
+             loadedChunks[key].updateLeavesWind(); // Call the method on the chunk instance
+        }
+    }
+    // Wind end
+
+
+
+        // Ensure the local player's animation and movement are updated first
+		updateChunks(playerModel.position.x, playerModel.position.z, currentSeed);
+        moveCharacter(); // Handle movement for the local player
+        updateAnimationState(); // Update animation state for your player character
+
+        if (isPlayerModelLoaded) {
+            const currentTime = Date.now();
+             // Only send updates if the interval has passed or if jump state changes
+            if (currentTime - lastPositionUpdateTime >= positionUpdateInterval || jumpTriggered) {
+                const isMoving = keysPressed['w'] || keysPressed['s'] || keysPressed['a'] || keysPressed['d'];
+                socket.emit('player-move', {
+                    id: socket.id,
+                    x: playerModel.position.x,
+                    y: playerModel.position.y,
+                    z: playerModel.position.z,
+                    rotation: playerModel.rotation.y,
+                    keysPressed,
+                    isRunning,
+                    isMoving, // Include isMoving state
+                    isJumping: isJumping // Use the isJumping state controlled by animation
+                });
+                lastPositionUpdateTime = currentTime;
+                 // Reset jumpTriggered AFTER emitting, so it's only sent once per jump initiation
+                 if (jumpTriggered) jumpTriggered = false;
+            }
+        }
+
+        // Update the player's animation mixer if it exists
+        if (mixer) mixer.update(delta);
+
+        // Loop through all players and update their animation mixers and states
+        for (const id in players) {
+            const player = players[id];
+
+            // Ensure keysPressed is defined, defaulting to an empty object if not
+            // These are updated in the 'player-move' handler
+            const { keysPressed = {}, isRunning = false, isJumping = false } = player;
+
+
+            // Only update if the player's mixer exists and animations are ready
+            if (player.mixer && player.animationsReady) {
+                player.mixer.update(delta); // Update animation for this player
+
+                // Update the animation state based on the player's movement data
+                updateAnimationStateForClonedPlayer(player, keysPressed, isRunning, isJumping);
+            }
+        }
+
+        updateCamera(delta);
+        composer.render();
+    }
+
+    animate();
+
+
+    const chatInput = document.getElementById('chat-input');
+    const chatMessages = document.getElementById('chat-messages');
+
+    chatInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter' && chatInput.value.trim() !== '') {
+            const message = chatInput.value;
+            socket.emit('chat-message', message);
+            chatInput.value = '';
+        }
+    });
+
+    const appendMessage = (data, isAdmin = false) => {
+        const msgElem = document.createElement('div');
+        msgElem.textContent = isAdmin ? `${data.message}` : `${data.username}: ${data.message}`;
+        chatMessages.appendChild(msgElem);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    };
+
+    socket.on('chat-message', appendMessage);
+    socket.on('chat-message-admin', (data) => appendMessage(data, true));
+
+
+    // Resize handling
+    window.addEventListener('resize', () => {
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+    });
+
+    // Pointer lock on click
+    renderer.domElement.addEventListener('click', () => renderer.domElement.requestPointerLock());
+
+    let yaw = 0, pitch = 0;
+
+    // Pointer lock change
+    document.addEventListener('pointerlockchange', () => {
+        document.onpointerlockchange = () => (document.pointerLockElement === renderer.domElement) ?
+            document.addEventListener('mousemove', onMouseMove, false) :
+            document.removeEventListener('mousemove', onMouseMove, false);
+    });
+
+    // Mouse move handler
+    function onMouseMove(event) {
+        const sensitivity = 0.002;
+        yaw -= (event.movementX || 0) * sensitivity;
+        pitch -= (event.movementY || 0) * sensitivity;
+
+        pitch = Math.max(-Math.PI / 3, Math.min(Math.PI / 3, pitch));
+        camera.rotation.set(pitch, yaw, 0);
+
+    }
+
+
+    socket.on('connect', () => {
+        localPlayerId = socket.id; // ✅ Save it
+        console.log("Connected:", localPlayerId);
+        socket.emit('request-all-players');
+    });
+
+    // Removed the redundant 'player-joined' listener as 'player-move' handles creation
+
+
+    socket.on('player-move', (d) => {
+        // IMPORTANT: Do not process move data for the local player here.
+        // The local player's position and animation are handled by local input and update functions.
+        if (localPlayerId && d.id === localPlayerId) {
+            return;
+        }
+
+        let pc = players[d.id];
+
+        if (!pc) {
+            if (loadingPlayers.has(d.id)) return;
+            loadingPlayers.add(d.id);
+            loader.load('models/ThePlayerModel.glb', (gltf) => {
+                pc = gltf.scene;
+                pc.scale.set(1, 1, 1);
+                pc.position.set(d.x, d.y, d.z);
+                pc.rotation.y = d.rotation;
+
+                // Set shadows for meshes
+                pc.traverse(o => o.isMesh && (o.castShadow = true, o.receiveShadow = true));
+
+                // Create Animation Mixer and load animations
+                const m = new THREE.AnimationMixer(pc);
+                pc.mixer = m;
+
+                // Store the last received state on the clone object
+                pc.keysPressed = d.keysPressed || {};
+                pc.isRunning = d.isRunning || false;
+                pc.isJumping = d.isJumping || false; // Store isJumping state
+                pc.lastJumpStartTime = 0; // Initialize jump start time
+
+                loadAnimationsForClonedPlayer(pc);
+
+                scene.add(pc);
+                players[d.id] = pc;
+                loadingPlayers.delete(d.id);
+            });
+            return;
+        }
+
+        // If the player's animations are ready, update the position and animation state
+        if (pc.animationsReady) {
+            pc.position.set(d.x, d.y, d.z);
+            pc.rotation.y = d.rotation;
+
+            // Update the stored state on the clone
+            pc.keysPressed = d.keysPressed;
+            pc.isRunning = d.isRunning;
+            pc.isJumping = d.isJumping; // Update isJumping state
+
+            // Update the animation state based on the received state for the CLONE
+            updateAnimationStateForClonedPlayer(pc, pc.keysPressed, pc.isRunning, pc.isJumping);
+        }
+    });
+
+
+    socket.on('player-disconnected', (playerId) => {
+        if (players[playerId]) {
+            scene.remove(players[playerId]);
+
+            // Check if mixer exists and if stopAllActions is a function before calling it
+            if (players[playerId].mixer && typeof players[playerId].mixer.stopAllActions === 'function') {
+                players[playerId].mixer.stopAllActions();
+                // It's good practice to uncache the root when disposing the mixer
+                players[playerId].mixer.uncacheRoot(players[playerId]);
+                players[playerId].mixer = null; // Dereference the mixer
+            }
+
+            // Dispose of geometry and materials to free up memory
+            players[playerId].traverse((object) => {
+                if (object.isMesh) {
+                    if (object.geometry) object.geometry.dispose();
+                    if (object.material) {
+                        // In case of multiple materials
+                        if (Array.isArray(object.material)) {
+                            for (const material of object.material) material.dispose();
+                        } else {
+                            object.material.dispose();
+                        }
+                    }
+                }
+            });
+
+            delete players[playerId];
+            console.log(`🚪 Player disconnected: ${playerId}`);
+        }
+    });
+
+
+
+
+
+
+/* CHUNK SYSTEM START */
+
+// === LIGHTING SETUP ===
+const Sun = new THREE.DirectionalLight(0xffffff, 1);
+Sun.position.set(0, 30, -35);
+Sun.castShadow = true;
+
+Sun.shadow.camera.left = -50;
+Sun.shadow.camera.right = 50;
+Sun.shadow.camera.top = 50;
+Sun.shadow.camera.bottom = -50;
+Sun.shadow.camera.near = 1;
+Sun.shadow.camera.far = 100;
+Sun.shadow.mapSize.width = 4096;
+Sun.shadow.mapSize.height = 4096;
+Sun.shadow.bias = -0.0005;        // Added bias for shadow acne reduction
+Sun.shadow.normalBias = 0.02;     // Better normal bias
+
+Sun.target.position.set(0, 0, 0);
+scene.add(Sun.target);
+scene.add(Sun);
+
+// === GLOBAL TEXTURES ===
+
+const grassTexture = textureLoader.load('textures/grass.png');
+grassTexture.wrapS = grassTexture.wrapT = THREE.RepeatWrapping;
+grassTexture.repeat.set(32, 32);
+
+const treeTexture = textureLoader.load('textures/tree.png');
+treeTexture.wrapS = treeTexture.wrapT = THREE.RepeatWrapping;
+treeTexture.repeat.set(2, 4);
+
+const grassNormalMap = textureLoader.load('textures/grass_NormalMap.png');
+const treeNormalMap = textureLoader.load('textures/tree_NormalMap.png');
+const leavesNormalMap = textureLoader.load('textures/leaves_NormalMap.png');
+const rockNormalMap = textureLoader.load('textures/rock_NormalMap.png');
+
+const leavesTexture = textureLoader.load('textures/leaves.png');
+leavesTexture.wrapS = leavesTexture.wrapT = THREE.RepeatWrapping;
+leavesTexture.repeat.set(4, 4);
+
+const rockTexture = textureLoader.load('textures/rock.png');
+rockTexture.wrapS = rockTexture.wrapT = THREE.RepeatWrapping;
+rockTexture.repeat.set(4, 4);
+
+// === GENERAL SETUP ===
+let currentSeed = "1337";
+const loadedChunks = {};
+const terrainHeight = 0; // You can raise for hills/mountains
+const radius = 2; // 12z12 grid
+
+function createRNG(seed) {
+    let t = seed ^ 0xDEADBEEF;
+    return function() {
+        t = Math.imul(t, 0x6D2B79F5);
+        t ^= t >>> 15;
+        t = Math.imul(t, 0x27D4EB2D);
+        t ^= t >>> 15;
+        return (t >>> 0) / 4294967296;
+    };
+}
+
+function getTerrainHeight(x, y) {
+    return Math.sin(x * 0.2) * Math.cos(y * 0.2) * terrainHeight;
+}
+
+// Faster height lookup
+const getHeightAt = (x, z) => getTerrainHeight(x, z);
+
+// === CHUNK CLASS ===
+class Chunk {
+	constructor(chunkX, chunkZ, scene, seed) {
+		this.chunkX = chunkX;
+		this.chunkZ = chunkZ;
+		this.scene = scene;
+		this.seed = seed;
+		this.rng = createRNG(seed);
+
+		this.collisionObjects = [];
+
+		this.mesh = this.createTerrain();
+		this.scene.add(this.mesh);
+
+		this.floorMesh = this.createRaycastFloor();
+		this.scene.add(this.floorMesh);
+
+		this.createTrees();
+		this.createRocks();
+		this.createBushes();
+		this.createTreeLog();
+	}
+
+	random() {
+		return this.rng();
+	}
+
+	createTerrain() {
+		const geometry = new THREE.PlaneGeometry(100, 100, 100, 100);
+		const positions = geometry.attributes.position;
+
+		for (let i = 0; i < positions.count; i++) {
+			const localX = positions.getX(i);
+			const localY = positions.getY(i);
+			const worldX = localX + this.chunkX * 100;
+			const worldZ = localY + this.chunkZ * 100;
+			positions.setZ(i, getTerrainHeight(worldX, worldZ));
+		}
+
+		geometry.computeVertexNormals();
+
+		const material = new THREE.MeshStandardMaterial({
+			map: grassTexture,
+			roughness: 0.8,
+			metalness: 0,
+			depthWrite: true,
+			transparent: false
+		});
+
+		const mesh = new THREE.Mesh(geometry, material);
+		mesh.rotation.x = -Math.PI / 2;
+		mesh.receiveShadow = true;
+		mesh.position.set(this.chunkX * 100, 0, this.chunkZ * 100);
+		return mesh;
+	}
+
+createTrees() {
+    const treeCount = 50;
+
+    // Geometry for trunk and canopy
+    const trunkGeometry = new THREE.CylinderGeometry(0.2, 0.5, 1, 8);  // Trunk geometry
+    const leafGeometry = new THREE.SphereGeometry(3, 8, 8);  // Canopy geometry
+
+    const instancedTrunks = new THREE.InstancedMesh(trunkGeometry, new THREE.MeshStandardMaterial({ map: treeTexture, roughness: 0.8, metalness: 0 }), treeCount);
+    instancedTrunks.castShadow = true;
+    instancedTrunks.receiveShadow = true;
+
+    // Store instancedLeaves and leafOffsets on the chunk instance
+    this.instancedLeaves = new THREE.InstancedMesh(leafGeometry, new THREE.MeshStandardMaterial({ map: leavesTexture, roughness: 0.8, metalness: 0 }), treeCount * 10);
+    this.instancedLeaves.castShadow = true;
+    this.instancedLeaves.receiveShadow = true;
+
+    this.leafOffsets = []; // Store leafOffsets on the chunk instance
+
+    for (let i = 0; i < treeCount; i++) {
+        const treeX = this.chunkX * 100 + (this.random() * 100 - 50);
+        const treeZ = this.chunkZ * 100 + (this.random() * 100 - 50);
+        const treeY = getHeightAt(treeX, treeZ);
+
+        const trunkHeight = this.random() * 4 + 5;
+        const canopyHeight = this.random() * 3 + 1;
+
+        const trunkMatrix = new THREE.Matrix4()
+            .makeScale(2, trunkHeight, 2)
+            .setPosition(new THREE.Vector3(treeX, treeY + trunkHeight / 2, treeZ));
+        instancedTrunks.setMatrixAt(i, trunkMatrix);
+
+        const canopyPosition = new THREE.Vector3(treeX, treeY + trunkHeight + canopyHeight, treeZ);
+
+        for (let j = 0; j < 10; j++) {
+            const leafOffset = new THREE.Vector3(
+                (this.random() * 2 - 1) * canopyHeight * 0.9,
+                (this.random() * 2 - 1) * canopyHeight * 0.9,
+                (this.random() * 2 - 1) * canopyHeight * 0.9
+            );
+            const leafMatrix = new THREE.Matrix4()
+                .setPosition(canopyPosition.clone().add(leafOffset))
+                .scale(new THREE.Vector3(1, 1, 1));
+            this.instancedLeaves.setMatrixAt(i * 10 + j, leafMatrix); // Use this.instancedLeaves
+
+            // Store the initial leaf position for later updates
+            this.leafOffsets.push(leafOffset); // Use this.leafOffsets
+        }
+
+        const trunkWidth = 0.5;
+        const canopyWidth = canopyHeight * 0.7;
+        const collisionRadius = Math.max(trunkWidth, canopyWidth);
+
+        this.collisionObjects.push({
+            position: new THREE.Vector3(treeX, treeY, treeZ),
+            radius: collisionRadius / 16
+        });
+    }
+
+    this.scene.add(instancedTrunks);
+    this.scene.add(this.instancedLeaves); // Add the instance leaves to the scene
+}
+
+// Function to animate the leaves with a wind effect (inside Chunk class)
+updateLeavesWind() { // No parameters needed now
+    // Check if this chunk has leaves before trying to update
+    if (!this.instancedLeaves || !this.leafOffsets || this.leafOffsets.length === 0) {
+        return;
+    }
+
+    const windStrength = 0.0005;
+    // windDirection is not currently used in the sway calculation, but keep if needed later
+    // const windDirection = new THREE.Vector3(1, 0, 0);
+
+    const time = performance.now();
+    for (let i = 0; i < this.leafOffsets.length; i++) { // Use this.leafOffsets
+        const leafOffset = this.leafOffsets[i]; // Use this.leafOffsets
+
+        // Apply sinusoidal movement for a smooth sway effect
+        const swayX = Math.sin(time * 0.001 + i * 0.1) * windStrength * leafOffset.x;
+        const swayY = Math.cos(time * 0.001 + i * 0.1) * windStrength * leafOffset.y;
+        const swayZ = Math.sin(time * 0.001 + i * 0.2) * windStrength * leafOffset.z;
+
+        // Adjust the leaf's position based on the sway values
+        const matrix = new THREE.Matrix4();
+        // Use getMatrixAt on the chunk's instancedLeaves property
+        this.instancedLeaves.getMatrixAt(i, matrix);
+
+        const position = new THREE.Vector3();
+        const quaternion = new THREE.Quaternion();
+        const scale = new THREE.Vector3();
+
+        matrix.decompose(position, quaternion, scale);
+        position.add(new THREE.Vector3(swayX, swayY, swayZ));
+        matrix.compose(position, quaternion, scale);
+
+
+        // Set the new position for the leaf instance using the chunk's instancedLeaves property
+        this.instancedLeaves.setMatrixAt(i, matrix);
+    }
+
+    // Mark the instance matrix as needing an update
+    this.instancedLeaves.instanceMatrix.needsUpdate = true;
+}
+
+createBushes() {
+    const bushCount = 8;
+    const bushGeometry = new THREE.SphereGeometry(1.25, 6, 6);  // Geometry for bushes
+    const bushMaterial = new THREE.MeshStandardMaterial({ map: leavesTexture, roughness: 0.9, metalness: 0 });
+
+    const instancedBushes = new THREE.InstancedMesh(bushGeometry, bushMaterial, bushCount);
+    instancedBushes.castShadow = true;
+    instancedBushes.receiveShadow = true;
+
+    for (let i = 0; i < bushCount; i++) {
+        const bushX = this.chunkX * 100 + (this.random() * 100 - 50);
+        const bushZ = this.chunkZ * 100 + (this.random() * 100 - 50);
+        const bushY = getHeightAt(bushX, bushZ);
+
+        const matrix = new THREE.Matrix4().setPosition(new THREE.Vector3(bushX, bushY, bushZ));
+        instancedBushes.setMatrixAt(i, matrix);
+
+        // Calculate the collision radius based on the bush's geometry
+        const bushRadius = 1.25;  // Bush radius is 1.25 (size from geometry)
+
+        // Add the bush to the collision objects with the adjusted radius
+        /*this.collisionObjects.push({
+            position: new THREE.Vector3(bushX, bushY, bushZ),
+            radius: bushRadius / 16  // Adjusted radius for better collision detection
+        });*/
+    }
+
+    this.scene.add(instancedBushes);
+}
+
+createRocks() {
+    const rockCount = 5;
+    const rockGeometry = new THREE.IcosahedronGeometry(3, 0);  // Geometry for rocks
+    const rockMaterial = new THREE.MeshStandardMaterial({ map: rockTexture, roughness: 0.8, metalness: 0 });
+
+    const instancedRocks = new THREE.InstancedMesh(rockGeometry, rockMaterial, rockCount);
+    instancedRocks.castShadow = true;
+    instancedRocks.receiveShadow = true;
+
+    for (let i = 0; i < rockCount; i++) {
+        const rockX = this.chunkX * 100 + (this.random() * 100 - 50);
+        const rockZ = this.chunkZ * 100 + (this.random() * 100 - 50);
+        const rockY = getHeightAt(rockX, rockZ);
+
+        const matrix = new THREE.Matrix4().setPosition(new THREE.Vector3(rockX, rockY, rockZ));
+        instancedRocks.setMatrixAt(i, matrix);
+
+        // Calculate the collision radius based on the rock's geometry
+        const rockRadius = 3;  // Rock radius is 3 (size from geometry)
+
+        // Add the rock to the collision objects with the adjusted radius
+        this.collisionObjects.push({
+            position: new THREE.Vector3(rockX, rockY, rockZ),
+            radius: rockRadius / 1.5  // Adjusted radius for better collision detection
+        });
+    }
+
+    this.scene.add(instancedRocks);
+}
+
+
+createTreeLog() {
+    const logCount = 2;  // Number of logs to generate
+
+    // Geometry for the tree log (cylinder)
+    const logGeometry = new THREE.CylinderGeometry(0.5, 0.6, 2, 8);  // A long and narrow cylinder for the log
+    const logMaterial = new THREE.MeshStandardMaterial({ map: treeTexture, roughness: 0.8, metalness: 0 });
+
+    const instancedLogs = new THREE.InstancedMesh(logGeometry, logMaterial, logCount);
+    instancedLogs.castShadow = true;
+    instancedLogs.receiveShadow = true;
+
+    for (let i = 0; i < logCount; i++) {
+        const logX = this.chunkX * 100 + (this.random() * 100 - 50);
+        const logZ = this.chunkZ * 100 + (this.random() * 100 - 50);
+        const logY = getHeightAt(logX, logZ);  // Get the ground height at the position
+
+        // Create the matrix for the log
+        const logMatrix = new THREE.Matrix4();
+        
+        // Apply transformations separately
+        logMatrix.makeScale(1, 1, 5);  // Scale the log to make it long
+        logMatrix.setPosition(new THREE.Vector3(logX, logY + 0.25, logZ));  // Position the log just above the ground
+        logMatrix.multiply(new THREE.Matrix4().makeRotationX(Math.PI / 2));  // Rotate the log 90 degrees to make it horizontal
+
+        // Set the matrix for the instanced mesh
+        instancedLogs.setMatrixAt(i, logMatrix);
+
+        // Add the collision object for the log
+        const logRadius = 0.3;  // Radius of the log
+        const logLength = 5;  // Length of the log
+
+        // Now make the collision shape a sideways cylinder:
+        const collisionCenter = new THREE.Vector3(logX, logY, logZ);  // Position the collision shape at the log's center
+
+        // Rotation of the collision shape to match the log's sideways rotation
+        const collisionRotation = new THREE.Euler(Math.PI / 2, 0, 0);  // Rotate to make it horizontal (sideways)
+
+        // The collision shape should be a cylinder, matching the log's radius and length
+        const collisionObject = {
+            position: collisionCenter,  // Position at the center of the log
+            radius: logRadius,  // The radius of the log (used for collision)
+            height: logLength,  // The length of the log (used as the height for the collision cylinder)
+            rotation: collisionRotation,  // The same rotation as the log (sideways)
+        };
+
+        // Store the collision object for later use
+        this.collisionObjects.push(collisionObject);
+    }
+
+    // Add the instanced logs to the scene
+    this.scene.add(instancedLogs);  
+}
+
+
+
+	
+	createRaycastFloor() {
+		const floorGeometry = new THREE.PlaneGeometry(100, 100, 100, 100);
+		const floorPositions = floorGeometry.attributes.position;
+
+		for (let i = 0; i < floorPositions.count; i++) {
+			const localX = floorPositions.getX(i);
+			const localY = floorPositions.getY(i);
+			const worldX = localX + this.chunkX * 100;
+			const worldZ = localY + this.chunkZ * 100;
+			floorPositions.setZ(i, getTerrainHeight(worldX, worldZ));
+		}
+
+		floorGeometry.computeVertexNormals();
+		const floorMaterial = new THREE.MeshStandardMaterial({ map: grassTexture });
+		const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+		floor.rotation.x = -Math.PI / 2;
+		floor.receiveShadow = true;
+		floor.position.set(this.chunkX * 100, 0, this.chunkZ * 100);
+		return floor;
+	}
+
+	destroy() {
+		this.scene.remove(this.mesh);
+		this.mesh.geometry.dispose();
+		this.mesh.material.dispose();
+
+		this.scene.remove(this.floorMesh);
+		this.floorMesh.geometry.dispose();
+		this.floorMesh.material.dispose();
+	}
+}
+
+
+// === CHUNK UPDATING SYSTEM ===
+function updateChunks(playerX, playerZ, seed) {
+    if (currentSeed !== seed) {
+        Object.keys(loadedChunks).forEach(key => loadedChunks[key].destroy());
+        Object.keys(loadedChunks).forEach(key => delete loadedChunks[key]);
+        currentSeed = seed;
+    }
+
+    const chunkX = Math.floor(playerX / 100);
+    const chunkZ = Math.floor(playerZ / 100);
+
+    const neededChunks = new Set();
+    for (let dz = -radius; dz <= radius; dz++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+            const key = `${chunkX + dx},${chunkZ + dz}`;
+            if (!loadedChunks[key]) {
+                loadedChunks[key] = new Chunk(chunkX + dx, chunkZ + dz, scene, seed);
+            }
+            neededChunks.add(key);
+        }
+    }
+
+    for (const key in loadedChunks) {
+        if (!neededChunks.has(key)) {
+            loadedChunks[key].destroy();
+            delete loadedChunks[key];
+        }
+    }
+}
+
+/* CHUNK SYSTEM END */
+
+
+
+// Wind particle START
+
+const particleCount = 20;
+const geometry = new THREE.BufferGeometry();
+const positions = new Float32Array(particleCount * 3);
+const velocities = new Float32Array(particleCount * 3); // Wind direction
+
+// Set WindSpeed to control the wind's strength
+let WindSpeed = 0.2;  // Adjust this value to control the overall wind speed
+
+// Initialize the wind particles after the texture is loaded
+let material;
+
+// Load the wind texture asynchronously
+textureLoader.load(
+  'textures/wind.png',  // Path to your wind texture
+  (texture) => {
+    // Create the material for the wind particles once the texture is loaded
+    material = new THREE.PointsMaterial({
+      map: texture,  // Apply the loaded texture to the particles
+      size: 15,  // Keep a consistent size for better wind effect
+      transparent: true,
+      opacity: 0.03,  // Slightly more opacity for soft look
+      blending: THREE.AdditiveBlending,  // Makes particles glow a bit
+      sizeAttenuation: true,  // Ensures particles look smaller when further away
+    });
+
+    // Initialize the wind particles
+    for (let i = 0; i < particleCount; i++) {
+      const x = Math.random() * 100 - 50;
+      const y = Math.random() * 20;
+      const z = Math.random() * 100 - 50;
+
+      positions[i * 3] = x;
+      positions[i * 3 + 1] = y;
+      positions[i * 3 + 2] = z;
+
+      // Horizontal wind direction (mostly along X)
+      velocities[i * 3] = WindSpeed * (0.5 + Math.random() * 0.5);     // x
+      velocities[i * 3 + 1] = (Math.random() - 0.5) * 0.1; // y (slight up/down drift)
+      velocities[i * 3 + 2] = (Math.random() - 0.5) * 0.2; // z
+    }
+
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('velocity', new THREE.BufferAttribute(velocities, 3));
+
+    // Create the points object (using Points instead of Lines)
+    const points = new THREE.Points(geometry, material);
+    scene.add(points);
+  },
+  undefined, // On progress callback (optional)
+  (error) => {
+    console.error('Error loading texture:', error);
+  }
+);
+
+// Wind direction vector (global direction)
+const windDirection = new THREE.Vector3(1, 0, 0); // Wind coming from the positive X direction
+
+// Function to update particles based on WindSpeed and direction
+function updateWindParticles() {
+  const posAttr = geometry.getAttribute('position');
+  const velAttr = geometry.getAttribute('velocity');
+
+  // Update particle positions based on velocities influenced by WindSpeed
+  for (let i = 0; i < particleCount; i++) {
+    // Apply wind gusts and turbulence for a more organic effect
+    const gustFactor = (Math.random() - 0.5) * 0.05;  // Smaller wind gust variation for more subtle effect
+
+    // Movement calculations with sinusoidal waves for smoother, more organic motion
+    let x = posAttr.getX(i) + velAttr.getX(i) + gustFactor + Math.sin(i * 0.1 + performance.now() * 0.001) * 0.03;
+    let y = posAttr.getY(i) + velAttr.getY(i) + gustFactor + Math.cos(i * 0.1 + performance.now() * 0.001) * 0.03;
+    let z = posAttr.getZ(i) + velAttr.getZ(i) + gustFactor + Math.sin(i * 0.2 + performance.now() * 0.001) * 0.05;
+
+    // Reset particle if it moves out of range (looping effect)
+    if (x > 50) x = -50;
+    if (y > 20) y = 0;
+    if (z > 50) z = -50;
+
+    posAttr.setXYZ(i, x, y, z);
+  }
+
+  posAttr.needsUpdate = true;
+}
+// Wind particle END
+
+
+
+
+
+</script>
+
+</body>
+</html>
